@@ -1,34 +1,38 @@
-# app_local.py
-# Flask 3-compatible. macOS-friendly: Bleak scanner on main thread, Flask in background thread.
+# app_linux.py
+# Flask 3 + Bleak (Linux/BlueZ). Scanner on main thread, Flask in a background thread.
 
 import os
 import re
 import time
 import asyncio
 import threading
-from typing import Optional, List
+from typing import Optional, List, Tuple, Union
 from flask import Flask, jsonify, request
 from bleak import BleakScanner
 
 # -------- Config via env --------
-RAW_UUID = (os.getenv("TARGET_SERVICE_UUID") or "").strip()  # e.g. 1802 or 1234...90AB
+RAW_UUID = (os.getenv("TARGET_SERVICE_UUID") or "").strip()   # e.g. 1802 or 1234...90AB
 TARGET_NAME_SUBSTR = (os.getenv("TARGET_NAME_SUBSTR") or "").strip()  # e.g. "Find Me"
 WALK_CMD = os.getenv("WALK_CMD", "kwkF")
 STOP_CMD = os.getenv("STOP_CMD", "d")
 
+# Linux/BlueZ specific
+ADAPTER = os.getenv("ADAPTER", "hci0")          # e.g., hci0 or hci1
+SCANNING_MODE = os.getenv("SCANNING_MODE", "active")  # "active" or "passive"
+
 def expand_uuid(u: str) -> Optional[str]:
     if not u:
         return None
-    s = u.lower()
+    s = u.lower().replace("-", "")
     if re.fullmatch(r"[0-9a-f]{4}", s):
         return f"0000{s}-0000-1000-8000-00805f9b34fb"
     if re.fullmatch(r"[0-9a-f]{8}", s):
         return f"{s}-0000-1000-8000-00805f9b34fb"
     if re.fullmatch(r"[0-9a-f]{32}", s):
         return f"{s[0:8]}-{s[8:12]}-{s[12:16]}-{s[16:20]}-{s[20:]}"
-    return s
+    return u  # assume already full form
 
-TARGET_SERVICE_UUID = expand_uuid(RAW_UUID)
+TARGET_SERVICE_UUID = (expand_uuid(RAW_UUID) or "").lower()
 
 # -------- Shared state (thread-safe) --------
 class BeaconState:
@@ -58,14 +62,14 @@ class BeaconState:
 
 state = BeaconState()
 
-# -------- Serial stub --------
+# -------- Serial stub (replace with your robot link) --------
 class PetoiSerialStub:
     def __init__(self): self.opened = True
     def send(self, token: str): print(f"[SERIAL:STUB] send -> {token!r}")
 
 serial = PetoiSerialStub()
 
-# -------- Flask app (will run in a thread) --------
+# -------- Flask app (in a thread) --------
 app = Flask(__name__)
 
 @app.get("/status")
@@ -73,8 +77,10 @@ def status():
     return jsonify({
         "ok": True,
         "config": {
-            "target_service_uuid": TARGET_SERVICE_UUID,
-            "target_name_substr": TARGET_NAME_SUBSTR,
+            "target_service_uuid": TARGET_SERVICE_UUID or None,
+            "target_name_substr": TARGET_NAME_SUBSTR or None,
+            "adapter": ADAPTER,
+            "scanning_mode": SCANNING_MODE,
             "walk_cmd": WALK_CMD,
             "stop_cmd": STOP_CMD,
         },
@@ -94,39 +100,63 @@ def stop():
     return jsonify({"ok": True, "sent": STOP_CMD})
 
 def run_flask():
+    # 127.0.0.1 keeps it local; change to 0.0.0.0 if you want LAN access.
     app.run(host="127.0.0.1", port=8080)
 
-# -------- Bleak scanner on main thread --------
+# -------- Bleak scanner (Linux-safe) --------
 def run_scanner():
     target_uuid = (TARGET_SERVICE_UUID or "").lower()
     name_sub = (TARGET_NAME_SUBSTR or "").lower()
 
+    def normalize(device, adv) -> Tuple[str, str, Optional[int], List[str]]:
+        # device may be a BLEDevice OR a string (address) on some Bleak versions
+        addr = device if isinstance(device, str) else getattr(device, "address", None) or "(noaddr)"
+        # prefer advertised local_name over device.name
+        name = getattr(adv, "local_name", None)
+        if not name:
+            name = device if isinstance(device, str) else getattr(device, "name", None)
+        name = str(name or "")
+        rssi = getattr(adv, "rssi", None)
+        uuids = [u.lower() for u in (getattr(adv, "service_uuids", None) or [])]
+        return addr, name, rssi, uuids
+
     def on_detect(device, adv):
-        # Build match rules: if UUID given, require it; else, match by name
-        suuids: List[str] = [u.lower() for u in (adv.service_uuids or [])]
-        name = (adv.local_name or device.name or "")  # prefer advertised local_name
-        match_uuid = (bool(target_uuid) and target_uuid in suuids)
-        match_name = (bool(name_sub) and name_sub in name.lower())
+        addr, name, rssi, suuids = normalize(device, adv)
+
+        # Matching rules: if UUID provided, require it; else optional name substring
+        has_uuid = bool(target_uuid) and target_uuid in suuids
+        has_name = (not name_sub) or (name and name_sub in name.lower())
+
         if target_uuid:
-            if match_uuid:
-                state.update(device.address, name or device.address, device.rssi)
-                print(f"[MATCH] {name or device.address}: RSSI={device.rssi}, UUIDs={suuids}")
+            if has_uuid:
+                state.update(addr, name or addr, rssi)
+                print(f"[MATCH] {name or addr}: RSSI={rssi}, UUIDs={suuids}")
         else:
-            # no UUID filter => accept by name if provided
-            if not name_sub or match_name:
-                state.update(device.address, name or device.address, device.rssi)
-                print(f"[MATCH] {name or device.address}: RSSI={device.rssi}, UUIDs={suuids}")
+            if has_name:
+                state.update(addr, name or addr, rssi)
+                print(f"[MATCH] {name or addr}: RSSI={rssi}, UUIDs={suuids}")
 
     async def main():
-        print("[INIT] Starting Flask in background thread...")
+        print("[INIT] Starting Flask on background thread…")
         threading.Thread(target=run_flask, daemon=True).start()
 
-        # If you want Bleak to pre-filter, pass service_uuids=[target_uuid]
-        scanner = BleakScanner(detection_callback=on_detect,
-                               service_uuids=[target_uuid] if target_uuid else None)
-        await scanner.start()
-        target_desc = target_uuid if target_uuid else "(no UUID filter)"
-        print(f"[SCAN] running; uuid={target_desc}, name contains '{name_sub or '(none)'}'")
+        # Pre-filter by UUID at the adapter if we have one
+        service_filter = [target_uuid] if target_uuid else None
+        print(f"[SCAN] adapter={ADAPTER} mode={SCANNING_MODE} "
+              f"uuid={target_uuid or '(none)'} name_sub='{name_sub or '(none)'}'")
+        scanner = BleakScanner(
+            detection_callback=on_detect,
+            adapter=ADAPTER,
+            scanning_mode=SCANNING_MODE,
+            service_uuids=service_filter
+        )
+        try:
+            await scanner.start()
+        except Exception as e:
+            print("[ERROR] Failed to start BLE scanner:", repr(e))
+            print("Hint: ensure bluetoothd is running, adapter powered, and (optionally) give python cap_net_raw/cap_net_admin.")
+            return
+
         try:
             while True:
                 await asyncio.sleep(0.5)
@@ -136,7 +166,8 @@ def run_scanner():
     asyncio.run(main())
 
 if __name__ == "__main__":
-    # Tips before running:
-    # - System Settings → Privacy & Security → Bluetooth → allow Terminal/IDE
-    # - Turn Bluetooth ON; keep iPhone LightBlue in foreground, Advertising
+    # Tips:
+    # - Keep your phone's Virtual Peripheral in the foreground (LightBlue).
+    # - If filtering by UUID, make sure RAW_UUID is correct; 16/32-bit get expanded automatically.
+    # - Export ADAPTER=hci1 if using a USB dongle.
     run_scanner()
