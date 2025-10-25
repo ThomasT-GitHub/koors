@@ -12,3 +12,7 @@ dist/
 # IDE settings
 .vscode/
 .idea/
+
+#local testing files
+
+local.py
