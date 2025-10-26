@@ -1,71 +1,115 @@
-# navigator.py
-# Beacon-homing walker with obstacle avoidance (FSM).
-# Requires: app_linux.py running (serving /status), and your command.py on PYTHONPATH.
+#!/usr/bin/env python3
+# project/robot/navigator.py
+# Beacon-homing walker with obstacle avoidance (FSM), using `controller`.
+# Reads RSSI from backend/app.py (/status). Matches prior navigator behavior.
 
+import os
 import time
-import math
 import random
 import requests
-from typing import Optional, Tuple
-from backend.input import get_distance
+from typing import Optional
 
-# ---- import your serial control helpers ----
-# Adjust to your actual module name(s)
-import sys, pathlib, os
-ROOT = pathlib.Path(__file__).resolve().parents[1]  # project-root
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+# --- import controller from sibling file ---
+try:
+    import controller  # project/robot/controller.py
+except Exception as e:
+    # Fallback: tweak sys.path to include this file's directory
+    import sys, pathlib
+    HERE = pathlib.Path(__file__).resolve().parent
+    if str(HERE) not in sys.path:
+        sys.path.insert(0, str(HERE))
+    import controller  # retry
 
-# Optional: allow a simulator via env var
-if os.getenv("DOG_SIM", "0") == "1":
-    from robot import command_sim as dog
-else:
-    from robot import command as dog
-
-APP_STATUS_URL = "http://127.0.0.1:8080/status"
-
-# -------- Tunables (start here) --------
-RSSI_EMA_ALPHA = 0.35            # smoothing factor for RSSI stream
-RSSI_VALID_AGE_S = 2.5           # max age (s) for RSSI sample to be considered fresh
-RSSI_MIN_SEEN = -95              # below this, assume too far/noise
-RSSI_APPROACH_GOOD = -70         # "close enough" to slow down / cautious approach
-
-SCAN_TURN_SECS = 0.35            # duration per sector during scan
-SCAN_SETTLE_MS = 150             # wait after a turn before sampling RSSI
-SCAN_SECTORS = 10                # how many heading samples in a full scan
-SCAN_COOLDOWN_S = 6.0            # don’t rescan too often
-
-ADVANCE_STEP_S = 0.6             # forward burst while homing
-MICRO_PAUSE_S = 0.15             # short stop between actions (keeps dog stable)
-
-OBSTACLE_NEAR_CM = 45            # stop/avoid if closer than this
-OBSTACLE_CLEAR_CM = 65           # treat path as clear above this
-AVOID_TURN_SECS = 0.5            # avoid: turn this long
-AVOID_STEP_S = 0.8               # avoid: step forward this long before re-eval
-
-LOST_TIMEOUT_S = 6.0             # if no decent RSSI for this long -> LOST state
-LOST_SPIN_SECS = 0.4             # quick spin segments to try to reacquire
-
-# Safety backstop to avoid infinite sprinting into something
-GLOBAL_RUN_LIMIT_S = 60 * 10     # 10 minutes (set None to disable)
-
-# --------- Sensor hooks (replace later with real HW/vision) ---------
-def get_ultrasonic_distance_cm() -> Optional[float]:
+# --- Optional ultrasonic support (safe if missing) ---
+def _try_get_distance() -> Optional[float]:
     """
-    TODO: Wire your HC-SR04 (or similar) here.
-    Return: distance in cm, or None if not available.
-    For now, return None (no reading). This keeps behavior RSSI-only with stop-gap safety.
+    If you later add a backend sensor function (e.g., backend/input.py:get_distance),
+    we’ll use it. Otherwise return None to keep FSM RSSI-only.
     """
-    return get_distance()
+    try:
+        # Lazy import to avoid hard dependency
+        from backend.input import get_distance  # type: ignore
+        d = get_distance()
+        return float(d) if d is not None else None
+    except Exception:
+        return None
 
-def get_camera_obstacle() -> bool:
-    """
-    TODO: Add simple vision gate, e.g., frontal bounding box occupancy or optical flow.
-    Return True if obstacle likely ahead (within ~1-2m cone), else False.
-    """
-    return False
+# ========= Config =========
+APP_STATUS_URL = os.getenv("APP_STATUS_URL", "http://127.0.0.1:8080/status")
+DOG_PORT = os.getenv("DOG_PORT", "/dev/ttyUSB0")
 
-# --------- BLE status client ---------
+# -------- Tunables --------
+RSSI_EMA_ALPHA = 0.35
+RSSI_VALID_AGE_S = 2.5
+RSSI_MIN_SEEN = -95
+RSSI_APPROACH_GOOD = -70
+
+SCAN_TURN_SECS = 0.35
+SCAN_SETTLE_MS = 150
+SCAN_SECTORS = 10
+SCAN_COOLDOWN_S = 6.0
+
+ADVANCE_STEP_S = 0.6
+MICRO_PAUSE_S = 0.15
+
+OBSTACLE_NEAR_CM = 45
+OBSTACLE_CLEAR_CM = 65
+AVOID_TURN_SECS = 0.5
+AVOID_STEP_S = 0.8
+
+LOST_TIMEOUT_S = 6.0
+LOST_SPIN_SECS = 0.4
+
+GLOBAL_RUN_LIMIT_S = 60 * 10  # 10 minutes
+
+# ========= Controller adapter (adds tiny helpers) =========
+class Dog:
+    """
+    Thin shim over your `controller` so the FSM can call a consistent set of methods.
+    """
+    def __init__(self):
+        self._connected = False
+
+    def connect_dog(self, port: Optional[str] = None, baud: Optional[int] = None) -> bool:
+        # controller.connect_dog takes (port), no baud needed
+        p = port or DOG_PORT
+        try:
+            ok = controller.connect_dog(p)
+            self._connected = bool(ok)
+            return self._connected
+        except Exception:
+            self._connected = False
+            return False
+
+    def is_connected(self) -> bool:
+        return self._connected
+
+    def disconnect(self):
+        try:
+            controller.disconnect()
+        finally:
+            self._connected = False
+
+    # Movement primitives (your controller already supports these)
+    def stop(self):
+        if hasattr(controller, "stop"):
+            controller.stop()
+        else:
+            # Fallback to a neutral stance
+            if hasattr(controller, "stand"):
+                controller.stand()
+
+    def stand(self): controller.stand() if hasattr(controller, "stand") else None
+    def sit(self): controller.sit() if hasattr(controller, "sit") else None
+
+    def walk_forward(self, duration: float): controller.walk_forward(duration)
+    def walk_backward(self, duration: float): controller.walk_backward(duration)
+    def turn_left(self, duration: float): controller.turn_left(duration)
+    def turn_right(self, duration: float): controller.turn_right(duration)
+
+dog = Dog()
+
+# ========= BLE status client =========
 class BeaconRSSI:
     def __init__(self):
         self.ema: Optional[float] = None
@@ -75,28 +119,26 @@ class BeaconRSSI:
 
     def refresh(self) -> Optional[float]:
         """
-        Pull RSSI from /status, update EMA, return current EMA if valid.
+        Pull RSSI from /status, update EMA, return EMA if valid.
+        Expects backend/app.py to serve {"beacon": {"rssi": int, "last_seen_epoch": float, ...}}
         """
         try:
             r = requests.get(APP_STATUS_URL, timeout=0.5)
             j = r.json()
             b = j.get("beacon") or {}
             rssi = b.get("rssi")
-            last_seen_epoch = b.get("last_seen_epoch") or 0.0
+            last_seen_epoch = float(b.get("last_seen_epoch") or 0.0)
 
             if rssi is None:
-                return self.ema  # no update
-
-            # Skip stale samples
-            if (time.time() - float(last_seen_epoch)) > RSSI_VALID_AGE_S:
                 return self.ema
 
-            # Update EMA
-            if self.ema is None:
-                self.ema = float(rssi)
-            else:
-                self.ema = RSSI_EMA_ALPHA * float(rssi) + (1.0 - RSSI_EMA_ALPHA) * self.ema
+            # Skip stale samples
+            if (time.time() - last_seen_epoch) > RSSI_VALID_AGE_S:
+                return self.ema
 
+            # EMA
+            rr = float(rssi)
+            self.ema = rr if self.ema is None else (RSSI_EMA_ALPHA * rr + (1.0 - RSSI_EMA_ALPHA) * self.ema)
             self.last_seen = time.time()
             self.addr = b.get("address")
             self.name = b.get("name")
@@ -107,33 +149,34 @@ class BeaconRSSI:
     def is_recent(self) -> bool:
         return (time.time() - self.last_seen) <= LOST_TIMEOUT_S
 
-# --------- Heading bookkeeping (time-based) ----------
+# ========= Heading bookkeeping (time-based) =========
 class TimedHeading:
     """
-    We don't have an IMU here; we keep a rough relative heading by integrating timed turns.
-    360° corresponds to one full in-place spin time determined by (SCAN_TURN_SECS * SCAN_SECTORS).
-    This is coarse but good enough for sector scans & coarse homing.
+    No IMU; integrate timed turns. One revolution ~ SCAN_SECTORS * SCAN_TURN_SECS.
     """
     def __init__(self):
         self.deg = 0.0
 
-    def turn_left_t(self, secs: float):
-        dog.turn_left(duration=secs)
-        self.deg += secs * self.deg_per_second()
-        self.deg = self.deg % 360.0
-
-    def turn_right_t(self, secs: float):
-        dog.turn_right(duration=secs)
-        self.deg -= secs * self.deg_per_second()
-        self.deg = self.deg % 360.0
-
     def deg_per_second(self) -> float:
-        # Calibrate empirically: one scan revolution ≈ SCAN_SECTORS * SCAN_TURN_SECS
         rev_secs = max(0.1, SCAN_SECTORS * SCAN_TURN_SECS)
         return 360.0 / rev_secs
 
-# --------- FSM States ----------
+    def turn_left_t(self, secs: float):
+        dog.turn_left(secs)
+        self.deg = (self.deg + secs * self.deg_per_second()) % 360.0
+
+    def turn_right_t(self, secs: float):
+        dog.turn_right(secs)
+        self.deg = (self.deg - secs * self.deg_per_second()) % 360.0
+
+# ========= FSM =========
 SEARCH, ALIGN, ADVANCE, AVOID, LOST = "SEARCH", "ALIGN", "ADVANCE", "AVOID", "LOST"
+
+def get_ultrasonic_distance_cm() -> Optional[float]:
+    return _try_get_distance()  # None unless you add backend/input.py:get_distance
+
+def get_camera_obstacle() -> bool:
+    return False  # stub (add vision later if desired)
 
 class Navigator:
     def __init__(self):
@@ -159,43 +202,29 @@ class Navigator:
     def path_clear(self) -> bool:
         d = get_ultrasonic_distance_cm()
         if d is None:
-            # Without an ultrasonic reading, be conservative near strong RSSI
             return True
         return d >= OBSTACLE_CLEAR_CM
 
     def bearing_scan(self) -> Optional[int]:
-        """
-        Spin in-place, sampling RSSI across sectors. Return index of best sector (0..SCAN_SECTORS-1).
-        Also recenters heading estimate to that sector (coarse).
-        """
         self.log("Starting bearing scan…")
-        best_idx = None
-        best_val = -9999.0
-
-        # Choose spin direction randomly to avoid bias
+        best_idx, best_val = None, -9999.0
         spin_left = random.choice([True, False])
 
-        # Do one full revolution sampling equally spaced sectors
         for i in range(SCAN_SECTORS):
-            # turn to next sector
             if spin_left:
                 self.hdg.turn_left_t(SCAN_TURN_SECS)
             else:
                 self.hdg.turn_right_t(SCAN_TURN_SECS)
 
             time.sleep(SCAN_SETTLE_MS / 1000.0)
-
             rssi = self.beacon.refresh()
-            if rssi is not None:
-                if rssi > best_val:
-                    best_val = rssi
-                    best_idx = i
+            if rssi is not None and rssi > best_val:
+                best_val = rssi
+                best_idx = i
 
-        # Rewind roughly back to the best sector heading
+        # Rewind to best sector
         if best_idx is not None:
-            # how far to rotate back to the best sector?
             steps = (SCAN_SECTORS - 1 - best_idx) if spin_left else (best_idx + 1)
-            # approximate opposite direction small steps to face best
             turn_secs = steps * SCAN_TURN_SECS
             if spin_left:
                 self.hdg.turn_right_t(turn_secs)
@@ -207,104 +236,87 @@ class Navigator:
         return best_idx
 
     def step(self):
-        # global safety
+        # Global backstop
         if GLOBAL_RUN_LIMIT_S and (time.time() - self.global_start) > GLOBAL_RUN_LIMIT_S:
             self.log("Global time limit reached; stopping.")
             dog.stop()
             raise SystemExit
 
-        # Always refresh beacon EMA
+        # Refresh RSSI
         rssi = self.beacon.refresh()
-
-        # Track closest so far (for simple “are we improving?” checks)
         if rssi is not None:
             self.closest_rssi_seen = max(self.closest_rssi_seen, rssi)
 
-        # State transitions and actions
+        # --- SEARCH ---
         if self.state == SEARCH:
-            # If we have recent RSSI, jump to ALIGN (or ADVANCE if very strong)
             if self.beacon.is_recent() and (rssi is not None and rssi > RSSI_MIN_SEEN):
                 if (time.time() - self.last_scan_t) > SCAN_COOLDOWN_S:
                     self.bearing_scan()
                 self.state = ALIGN
                 return
 
-            # Otherwise, do small spins to try to reacquire
             self.log("No good RSSI; spinning to find beacon…")
             self.hdg.turn_left_t(LOST_SPIN_SECS)
             time.sleep(MICRO_PAUSE_S)
             return
 
+        # --- ALIGN ---
         if self.state == ALIGN:
-            # If obstacle straight ahead, go AVOID first
             if self.obstacle_ahead():
                 self.log("Obstacle ahead during ALIGN; switching to AVOID.")
                 dog.stop()
                 self.state = AVOID
                 return
 
-            # If RSSI got strong enough, just ADVANCE cautiously
             if rssi is not None and rssi >= RSSI_APPROACH_GOOD:
                 self.state = ADVANCE
                 return
 
-            # Otherwise do a quick micro-scan to slightly improve bearing
             if (time.time() - self.last_scan_t) > SCAN_COOLDOWN_S:
                 self.bearing_scan()
 
-            # Nudge: tiny turn left/right to “hill-climb” RSSI
-            # We don’t know gradient directly; do a tiny random dither then commit if improved next loop.
             if random.random() < 0.5:
                 self.hdg.turn_left_t(0.18)
             else:
                 self.hdg.turn_right_t(0.18)
             time.sleep(MICRO_PAUSE_S)
 
-            # If we lose signal, go LOST
             if not self.beacon.is_recent() or (rssi is None or rssi < RSSI_MIN_SEEN):
                 self.state = LOST
             return
 
+        # --- ADVANCE ---
         if self.state == ADVANCE:
-            # Immediate safety
             if self.obstacle_ahead():
                 self.log("Obstacle detected during ADVANCE; switching to AVOID.")
                 dog.stop()
                 self.state = AVOID
                 return
 
-            # If RSSI vanished or got terrible, re-acquire
             if not self.beacon.is_recent() or (rssi is None or rssi < RSSI_MIN_SEEN):
                 self.log("Lost beacon while advancing.")
                 dog.stop()
                 self.state = LOST
                 return
 
-            # If we’re very close (strong RSSI), slow steps
             step_time = ADVANCE_STEP_S * (0.5 if rssi >= RSSI_APPROACH_GOOD else 1.0)
-
-            # Go forward a bit
             dog.walk_forward(step_time)
             time.sleep(MICRO_PAUSE_S)
 
-            # Small corrective turn “hill-climb”: if RSSI didn’t improve, try a tiny steer
             rssi_after = self.beacon.refresh() or rssi
-            if rssi_after < self.closest_rssi_seen - 1.5:  # degrade threshold
+            if rssi_after < self.closest_rssi_seen - 1.5:
                 if random.random() < 0.5:
                     self.hdg.turn_left_t(0.2)
                 else:
                     self.hdg.turn_right_t(0.2)
                 time.sleep(MICRO_PAUSE_S)
 
-            # Occasionally rescan to re-center
             if (time.time() - self.last_scan_t) > (SCAN_COOLDOWN_S * 1.5):
                 self.bearing_scan()
-
             return
 
+        # --- AVOID ---
         if self.state == AVOID:
-            # If an obstacle is seen, do a deterministic sidestep:
-            # Pick a direction, turn, forward, then return to ALIGN.
             turn_dir_left = random.random() < 0.5
             self.log(f"Avoiding: turn {'left' if turn_dir_left else 'right'} & step.")
             if turn_dir_left:
@@ -317,15 +329,14 @@ class Navigator:
             time.sleep(MICRO_PAUSE_S)
             dog.stop()
 
-            # If path looks clear, go ALIGN; else stay in AVOID for another cycle
             if self.path_clear():
                 self.state = ALIGN
             else:
                 self.log("Path still blocked; repeating avoid maneuver.")
             return
 
+        # --- LOST ---
         if self.state == LOST:
-            # Rapid small spins to re-acquire; if RSSI comes back, go SEARCH -> ALIGN
             self.log("Reacquiring beacon…")
             self.hdg.turn_right_t(LOST_SPIN_SECS)
             time.sleep(MICRO_PAUSE_S)
@@ -337,7 +348,11 @@ class Navigator:
     def run(self):
         self.log("Starting navigator. Connecting to dog…")
         if not dog.is_connected():
-            dog.connect_dog("/dev/ttyUSB0", 115200)
+            if not dog.connect_dog(DOG_PORT):
+                print(f"❌ Failed to open port {DOG_PORT}.")
+                print("💡 macOS ports look like /dev/tty.usbserial-XXXX or /dev/tty.usbmodem-XXXX")
+                print("   Linux/Pi ports look like /dev/ttyUSB0 or /dev/ttyAMA0 (add user to 'dialout').")
+                return
 
         # Neutral posture to start
         dog.stand()
