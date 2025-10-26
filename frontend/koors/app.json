@@ -10,7 +10,7 @@
     "newArchEnabled": true,
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.anonymous.koors",
+      "bundleIdentifier": "com.yourname.koors",
       "infoPlist": {
         "NSBluetoothAlwaysUsageDescription": "This app uses Bluetooth to create a peripheral device",
         "NSBluetoothPeripheralUsageDescription": "This app uses Bluetooth to create a peripheral device"

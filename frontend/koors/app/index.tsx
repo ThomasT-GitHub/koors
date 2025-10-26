@@ -1,4 +1,4 @@
-import {Animated, Text, StyleSheet, View} from 'react-native';
+import {Animated, Text, StyleSheet, View, Image} from 'react-native';
 import {useEffect, useMemo, useRef, useState} from "react";
 import HealthKit, {
   useMostRecentQuantitySample,
@@ -7,8 +7,7 @@ import KoorsButton from "@/components/KoorsButton";
 import {startAdvertising, stopAdvertising} from "munim-bluetooth-peripheral";
 import Voice from '@react-native-voice/voice';
 import {useMutation, useQuery} from "@tanstack/react-query";
-
-const koorsIp = "172.20.10.7"
+import {BACKEND_CONFIG} from "@/config";
 
 export default function HomeScreen() {
   const [heartRate, setHeartRate] = useState(useMostRecentQuantitySample("HKQuantityTypeIdentifierHeartRate")?.quantity ?? 0);
@@ -27,7 +26,7 @@ export default function HomeScreen() {
     queryKey: ['koorsStatus'],
     queryFn: async () => {
       console.log("attempting to get status...")
-      const resp = await fetch(`http://${koorsIp}:8080/dispatch_status`)
+      const resp = await fetch(`${BACKEND_CONFIG.BASE_URL}/dispatch_status`)
       const jsonResp = await resp.json()
       return jsonResp["status"]
     },
@@ -38,7 +37,7 @@ export default function HomeScreen() {
   const performMutation = useMutation({
     mutationFn: async (command: string) => {
       console.log("attempting to perform command " + command)
-      const resp = await fetch(`http://${koorsIp}:8080/perform?action=${command}`, {
+      const resp = await fetch(`${BACKEND_CONFIG.BASE_URL}/perform?perform=${command}`, {
         method: "POST",
       })
     }
@@ -47,7 +46,7 @@ export default function HomeScreen() {
   const dispatchMutation = useMutation({
     mutationFn: async () => {
       console.log("attempting to dispatch")
-      const resp = await fetch(`http://${koorsIp}:8080/dispatch`, {
+      const resp = await fetch(`${BACKEND_CONFIG.BASE_URL}/dispatch`, {
         method: "POST",
       })
     }
@@ -295,6 +294,17 @@ export default function HomeScreen() {
             </Animated.Text>
           </Animated.View>
         )}
+
+        {koorsState === 'searching' && (
+          <View style={styles.cameraOverlay}>
+            <Text style={styles.cameraLabel}>Koors Vision</Text>
+            <Image
+              source={{ uri: `${BACKEND_CONFIG.BASE_URL}/camera/stream` }}
+              style={styles.cameraStream}
+              resizeMode="contain"
+            />
+          </View>
+        )}
       </View>
   );
 }
@@ -371,5 +381,30 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     color: 'white',
     textAlign: 'center',
+  },
+
+  cameraOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(0, 0, 0, 0.95)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 20,
+  },
+
+  cameraLabel: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: '#d5af00',
+    marginBottom: 20,
+  },
+
+  cameraStream: {
+    width: '100%',
+    height: '80%',
+    borderRadius: 10,
   }
 });
