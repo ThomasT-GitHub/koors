@@ -7,6 +7,7 @@ import math
 import random
 import requests
 from typing import Optional, Tuple
+from backend.input import get_distance
 
 # ---- import your serial control helpers ----
 # Adjust to your actual module name(s)
@@ -55,7 +56,7 @@ def get_ultrasonic_distance_cm() -> Optional[float]:
     Return: distance in cm, or None if not available.
     For now, return None (no reading). This keeps behavior RSSI-only with stop-gap safety.
     """
-    return None
+    return get_distance()
 
 def get_camera_obstacle() -> bool:
     """
