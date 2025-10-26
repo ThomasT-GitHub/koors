@@ -328,6 +328,13 @@ def camera_stream():
         mimetype='multipart/x-mixed-replace; boundary=frame'
     )
 
+@app.get("/dispatch_status")
+def dispatch_status():
+    if _proc_alive(_nav_proc):
+        return jsonify({"status": "dispatched"})
+    else:
+        return jsonify({"status": "not_running"})
+
 def run_flask():
     # 127.0.0.1 keeps it local; change to 0.0.0.0 if you want LAN access.
     app.run(host="127.0.0.1", port=8080)
