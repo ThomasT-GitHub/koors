@@ -10,6 +10,65 @@ Koors is a robotic dog companion system that uses heart rate monitoring to detec
 2. **Backend** (Python/Flask) - BLE scanner that tracks the phone beacon's RSSI and manages robot navigation/commands
 3. **Robot** (Python) - Controls a Petoi Bittle robot dog via serial commands
 
+## Hackathon Context (KnightHacks VIII)
+
+**Project**: Koors - Autonomous Medication Delivery Companion
+**Event**: KnightHacks VIII
+**Timeline**: 36-hour hackathon MVP
+
+### Concept
+Koors is an autonomous robotic service companion that delivers medication when a health anomaly is detected. It combines a Petoi Bittle robot dog, an iOS companion app with Apple HealthKit integration, and BLE-based communication. The experience is designed to feel emotional and assistive — a "service dog" that comes to help when you can't move.
+
+### Demo Flow
+1. iOS app monitors user's heart rate via HealthKit
+2. If BPM > threshold (e.g., 110), app shows "anomaly detected" alert
+3. User (or operator) taps **Dispatch**
+4. Phone sends BLE signal; backend tracks RSSI
+5. Robot wakes, walks toward user (RSSI-based proximity homing)
+6. Robot plays "delivery" animation
+7. Servo payload box opens, presenting medication
+8. App shows "Delivered" confirmation
+
+### Tech Stack Summary
+- **Hardware**: Petoi Bittle + NyBoard v1_2 + Raspberry Pi 3A+
+- **Communication**: BLE RSSI proximity + UART serial
+- **Mobile**: iOS (React Native/Expo) + HealthKit + CoreBluetooth
+- **Backend**: Python + Flask + Bleak (BLE scanner)
+- **Control**: Python serial commands to Bittle
+
+### Team Tracks
+- **Mobile Lead**: iOS HealthKit + BLE beacon app
+- **Robot Control Lead**: Serial control + BLE listener on Pi
+- **Hardware Lead**: NyBoard + Pi + servo payload wiring
+- **Backend Lead**: Flask API for dispatch + telemetry
+
+## MVP Implementation Status
+
+### ✅ Completed Features
+- [x] **Heart rate monitoring** - HealthKit integration with live BPM display (frontend/koors/app/index.tsx:14)
+- [x] **BLE beacon advertising** - Phone advertises as "Koors Beacon" with service UUIDs (index.tsx:173-183)
+- [x] **BLE communication** - Backend scanner tracks beacon RSSI (backend/app.py:342-401)
+- [x] **Manual dispatch** - "Koors, IM DYING!" button triggers `/dispatch` endpoint (app.py:175-180)
+- [x] **Robot movement controller** - Full gesture/movement API (robot/controller.py)
+- [x] **Autonomous navigation** - RSSI-based beacon homing with FSM (robot/navigator.py)
+- [x] **Voice recognition** - "Koors, LISTEN!" for voice commands (index.tsx:115-232)
+- [x] **Camera streaming** - MJPEG stream from Pi Camera (backend/camera.py)
+
+### ⚠️ Partially Implemented
+- [~] **UI/UX polish** - Has heart rate display, state indicator, dispatch button; needs delivery confirmation
+
+### ❌ Remaining for MVP Demo
+- [ ] **Automatic HR dispatch trigger** - Currently manual button only; needs auto-trigger at BPM > threshold
+- [ ] **Servo payload control** - No servo code for medication box opening
+- [ ] **Delivery animation sequence** - Define specific robot gesture for "delivery moment"
+- [ ] **Delivery confirmation UI** - App should show "Delivered" state after robot arrival
+
+### Stretch Goals (if time permits)
+- [ ] Emotion LEDs / tail animation on robot
+- [ ] Cloud dashboard for status + telemetry logging
+- [ ] Obstacle avoidance refinement (ultrasonic sensor integration)
+- [ ] Multi-medication compartment support
+
 ## Architecture
 
 ### Communication Flow

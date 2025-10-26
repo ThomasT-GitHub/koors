@@ -17,26 +17,27 @@ from bleak import BleakScanner
 import robot.controller as dog
 
 # -------- Config via env --------
-RAW_UUID = (os.getenv("TARGET_SERVICE_UUID") or "").strip()   # e.g. 1802 or 1234...90AB
+RAW_UUID = (os.getenv("TARGET_SERVICE_UUID") or "").strip()  # e.g. 1802 or 1234...90AB
 TARGET_NAME_SUBSTR = (os.getenv("TARGET_NAME_SUBSTR") or "").strip()  # e.g. "Find Me"
 WALK_CMD = os.getenv("WALK_CMD", "kwkF")
 STOP_CMD = os.getenv("STOP_CMD", "d")
 
 # Linux/BlueZ specific
-ADAPTER = os.getenv("ADAPTER", "hci0")          # e.g., hci0 or hci1
+ADAPTER = os.getenv("ADAPTER", "hci0")  # e.g., hci0 or hci1
 SCANNING_MODE = os.getenv("SCANNING_MODE", "active")  # "active" or "passive"
 
 # Paths (project layout)
 HERE = pathlib.Path(__file__).resolve()
 PROJECT_ROOT = HERE.parents[1]  # project/
 ROBOT_DIR = PROJECT_ROOT / "robot"
-NAVIGATOR_PATH = ROBOT_DIR / "navigator.py"
+NAVIGATOR_PATH = ROBOT_DIR / "vision_navigator.py"  # Using vision-based navigator
 
 # Make sure we can import robot/controller.py for process_speech actions
 if str(ROBOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROBOT_DIR))
 try:
     import controller  # project/robot/controller.py
+
     _controller_ok = True
 except Exception as _e:
     _controller_ok = False
@@ -44,10 +45,21 @@ except Exception as _e:
 # Import camera module
 try:
     from camera import CameraManager, generate_mjpeg_stream
+
     _camera_ok = True
 except Exception as _e:
     _camera_ok = False
     print(f"[INIT] Camera module not available: {_e}")
+
+# Import person detector
+try:
+    from person_detector import PersonDetector
+
+    _detector_ok = True
+except Exception as _e:
+    _detector_ok = False
+    print(f"[INIT] Person detector not available: {_e}")
+
 
 def expand_uuid(u: str) -> Optional[str]:
     if not u:
@@ -61,7 +73,9 @@ def expand_uuid(u: str) -> Optional[str]:
         return f"{s[0:8]}-{s[8:12]}-{s[12:16]}-{s[16:20]}-{s[20:]}"
     return u  # assume already full form
 
+
 TARGET_SERVICE_UUID = (expand_uuid(RAW_UUID) or "").lower()
+
 
 # -------- Shared state (thread-safe) --------
 class BeaconState:
@@ -89,12 +103,18 @@ class BeaconState:
                 "age_secs": (time.time() - self.last_seen) if self.last_seen else None,
             }
 
+
 state = BeaconState()
+
 
 # -------- Serial stub (replace with your robot link) --------
 class PetoiSerialStub:
-    def __init__(self): self.opened = True
-    def send(self, token: str): print(f"[SERIAL:STUB] send -> {token!r}")
+    def __init__(self):
+        self.opened = True
+
+    def send(self, token: str):
+        print(f"[SERIAL:STUB] send -> {token!r}")
+
 
 serial = PetoiSerialStub()
 
@@ -102,8 +122,10 @@ serial = PetoiSerialStub()
 _nav_lock = threading.Lock()
 _nav_proc: Optional[subprocess.Popen] = None
 
+
 def _proc_alive(p: Optional[subprocess.Popen]) -> bool:
     return p is not None and (p.poll() is None)
+
 
 def start_navigator() -> dict:
     """Launch project/robot/navigator.py in a background process."""
@@ -120,6 +142,7 @@ def start_navigator() -> dict:
             return {"ok": True, "status": "dispatched", "pid": _nav_proc.pid}
         except Exception as e:
             return {"ok": False, "error": f"failed_to_start: {e}"}
+
 
 def stop_navigator(timeout: float = 3.0) -> dict:
     """Stop the running navigator process (if any)."""
@@ -141,6 +164,7 @@ def stop_navigator(timeout: float = 3.0) -> dict:
         except Exception as e:
             return {"ok": False, "error": f"failed_to_stop: {e}"}
 
+
 # ========== Flask app ==========
 app = Flask(__name__)
 
@@ -154,30 +178,82 @@ if _camera_ok:
     except Exception as e:
         print(f"[INIT] Failed to initialize camera manager: {e}")
 
+# ========== Person detector ==========
+detector = None
+if _detector_ok:
+    try:
+        detector = PersonDetector()
+        print("[INIT] Person detector initialized")
+    except Exception as e:
+        print(f"[INIT] Failed to initialize person detector: {e}")
+
+
 @app.get("/status")
 def status():
-    return jsonify({
-        "ok": True,
-        "config": {
-            "target_service_uuid": TARGET_SERVICE_UUID or None,
-            "target_name_substr": TARGET_NAME_SUBSTR or None,
-            "adapter": ADAPTER,
-            "scanning_mode": SCANNING_MODE,
-            "walk_cmd": WALK_CMD,
-            "stop_cmd": STOP_CMD,
-            "navigator_running": _proc_alive(_nav_proc),
-        },
-        "beacon": state.as_dict()
-    })
+    return jsonify(
+        {
+            "ok": True,
+            "config": {
+                "target_service_uuid": TARGET_SERVICE_UUID or None,
+                "target_name_substr": TARGET_NAME_SUBSTR or None,
+                "adapter": ADAPTER,
+                "scanning_mode": SCANNING_MODE,
+                "walk_cmd": WALK_CMD,
+                "stop_cmd": STOP_CMD,
+                "navigator_running": _proc_alive(_nav_proc),
+            },
+            "beacon": state.as_dict(),
+        }
+    )
+
+
+# ========== Vision detection endpoint ==========
+@app.get("/vision/detect")
+def vision_detect():
+    """Detect person in current camera frame and return position/distance."""
+    if not camera or not camera.is_running():
+        return jsonify({"ok": False, "error": "camera_not_running"}), 400
+
+    if not detector:
+        return jsonify({"ok": False, "error": "detector_not_available"}), 503
+
+    # Get latest frame
+    frame = camera.get_array()
+    if frame is None:
+        return jsonify({"ok": False, "error": "no_frame_available"}), 503
+
+    try:
+        # Detect person
+        position, distance, bbox = detector.detect_person(frame)
+
+        # Check for obstacles
+        has_obstacle = detector.check_obstacle(frame)
+
+        return jsonify({
+            "ok": True,
+            "position": position,
+            "distance": distance,
+            "obstacle": has_obstacle,
+            "bbox": bbox if bbox else None,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"detection_failed: {e}"}), 500
 
 
 # ---- NEW: dispatch navigator ----
 @app.post("/dispatch")
 def dispatch():
-    """Start the navigator in the background."""
+    """Start the vision navigator in the background."""
+    # Start camera if not already running
+    if camera and not camera.is_running():
+        print("[DISPATCH] Starting camera...")
+        camera.start()
+        time.sleep(1.0)  # Give camera time to warm up
+
     result = start_navigator()
     code = 200 if result.get("ok") else 500
     return jsonify({"dispatched": code == 200}), code
+
 
 # ---- NEW: halt navigator ----
 @app.post("/halt")
@@ -187,25 +263,57 @@ def halt():
     code = 200 if result.get("ok") else 500
     return jsonify(result), code
 
-# perform an action specified with the action query parameter
+
+# perform an action specified with the perform query parameter
 @app.post("/perform")
 def action():
     requested_action = request.args.get("perform")
-    match requested_action:
-        case "flip":
-            ok = dog.flip()
-            return 200 if ok else 500
-        case "help":
-            return jsonify({ "dispatched": True }), 200
-        case _:
-            return jsonify({ "message": "action parameter is required" }), 400
+    if not requested_action:
+        return jsonify({"message": "perform parameter is required"}), 400
+
+    # Map actions to robot controller functions
+    action_map = {
+        # Gestures
+        "flip": dog.flip,
+        "wave": dog.wave,
+        "bark": dog.bark,
+        "shake": dog.shake_hands,
+        "play_dead": dog.play_dead,
+        "stretch": dog.stretch,
+        "push_up": dog.push_up,
+        "roll": dog.roll,
+        # Movement
+        "sit": dog.sit,
+        "stand": dog.stand,
+        "stop": dog.stop,
+        # Special
+        "help": lambda: True,  # Trigger dispatch for help
+        "beep": dog.beep,
+    }
+
+    action_fn = action_map.get(requested_action)
+    if not action_fn:
+        return jsonify({"message": f"Unknown action: {requested_action}"}), 400
+
+    # Execute the action
+    ok = action_fn()
+    return jsonify({"success": ok}), (200 if ok else 500)
+
 
 # ---- NEW: process_speech (override navigation and perform an action) ----
 @app.post("/process_speech")
 def process_speech():
 
     if not _controller_ok:
-        return jsonify({"ok": False, "error": "controller import failed; ensure project/robot/controller.py is available"}), 500
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "controller import failed; ensure project/robot/controller.py is available",
+                }
+            ),
+            500,
+        )
 
     body = request.get_json(silent=True) or {}
     action = (body.get("action") or "").strip().lower()
@@ -221,9 +329,12 @@ def process_speech():
     def _cheer():
         # A simple cheer routine using common primitives
         # Fallbacks are safe if some calls don't exist.
-        if hasattr(controller, "bark"): controller.bark()
-        if hasattr(controller, "wave"): controller.wave()
-        if hasattr(controller, "bark"): controller.bark()
+        if hasattr(controller, "bark"):
+            controller.bark()
+        if hasattr(controller, "wave"):
+            controller.wave()
+        if hasattr(controller, "bark"):
+            controller.bark()
 
     def _call_if(name: str, *args, **kwargs):
         fn = getattr(controller, name, None)
@@ -256,8 +367,10 @@ def process_speech():
         time.sleep(2.0)
 
         # Safe finish
-        if hasattr(controller, "sit"): controller.sit()
-        if hasattr(controller, "disconnect"): controller.disconnect()
+        if hasattr(controller, "sit"):
+            controller.sit()
+        if hasattr(controller, "disconnect"):
+            controller.disconnect()
     except Exception as e:
         try:
             if hasattr(controller, "disconnect"):
@@ -267,6 +380,7 @@ def process_speech():
 
     return jsonify({"ok": True, "action": action, "overrode_navigation": True}), 200
 
+
 # ========== Camera endpoints ==========
 @app.get("/camera/status")
 def camera_status():
@@ -274,6 +388,7 @@ def camera_status():
     if not camera:
         return jsonify({"ok": False, "error": "camera_not_available"}), 503
     return jsonify({"ok": True, **camera.get_status()})
+
 
 @app.post("/camera/start")
 def camera_start():
@@ -290,6 +405,7 @@ def camera_start():
     else:
         return jsonify({"ok": False, "error": "failed_to_start"}), 500
 
+
 @app.post("/camera/stop")
 def camera_stop():
     """Stop camera capture."""
@@ -298,6 +414,7 @@ def camera_stop():
 
     camera.stop()
     return jsonify({"ok": True, "status": "stopped"})
+
 
 @app.get("/camera/snapshot")
 def camera_snapshot():
@@ -312,7 +429,8 @@ def camera_snapshot():
     if frame is None:
         return jsonify({"ok": False, "error": "no_frame_available"}), 503
 
-    return Response(frame, mimetype='image/jpeg')
+    return Response(frame, mimetype="image/jpeg")
+
 
 @app.get("/camera/stream")
 def camera_stream():
@@ -325,19 +443,22 @@ def camera_stream():
 
     return Response(
         generate_mjpeg_stream(camera),
-        mimetype='multipart/x-mixed-replace; boundary=frame'
+        mimetype="multipart/x-mixed-replace; boundary=frame",
     )
+
 
 @app.get("/dispatch_status")
 def dispatch_status():
     if _proc_alive(_nav_proc):
         return jsonify({"status": "dispatched"})
     else:
-        return jsonify({"status": "not_running"})
+        return jsonify({"status": "ready"})
+
 
 def run_flask():
     # 127.0.0.1 keeps it local; change to 0.0.0.0 if you want LAN access.
-    app.run(host="127.0.0.1", port=8080)
+    app.run(host="0.0.0.0", port=8080)
+
 
 # -------- Bleak scanner (Linux-safe) --------
 def run_scanner():
@@ -346,7 +467,11 @@ def run_scanner():
 
     def normalize(device, adv) -> Tuple[str, str, Optional[int], List[str]]:
         # device may be a BLEDevice OR a string (address) on some Bleak versions
-        addr = device if isinstance(device, str) else getattr(device, "address", None) or "(noaddr)"
+        addr = (
+            device
+            if isinstance(device, str)
+            else getattr(device, "address", None) or "(noaddr)"
+        )
         # prefer advertised local_name over device.name
         name = getattr(adv, "local_name", None)
         if not name:
@@ -378,19 +503,23 @@ def run_scanner():
 
         # Pre-filter by UUID at the adapter if we have one
         service_filter = [target_uuid] if target_uuid else None
-        print(f"[SCAN] adapter={ADAPTER} mode={SCANNING_MODE} "
-              f"uuid={target_uuid or '(none)'} name_sub='{name_sub or '(none)'}'")
+        print(
+            f"[SCAN] adapter={ADAPTER} mode={SCANNING_MODE} "
+            f"uuid={target_uuid or '(none)'} name_sub='{name_sub or '(none)'}'"
+        )
         scanner = BleakScanner(
             detection_callback=on_detect,
             adapter=ADAPTER,
             scanning_mode=SCANNING_MODE,
-            service_uuids=service_filter
+            service_uuids=service_filter,
         )
         try:
             await scanner.start()
         except Exception as e:
             print("[ERROR] Failed to start BLE scanner:", repr(e))
-            print("Hint: ensure bluetoothd is running, adapter powered, and (optionally) give python cap_net_raw/cap_net_admin.")
+            print(
+                "Hint: ensure bluetoothd is running, adapter powered, and (optionally) give python cap_net_raw/cap_net_admin."
+            )
             return
 
         try:
@@ -400,6 +529,7 @@ def run_scanner():
             await scanner.stop()
 
     asyncio.run(main())
+
 
 if __name__ == "__main__":
     # Tips:
