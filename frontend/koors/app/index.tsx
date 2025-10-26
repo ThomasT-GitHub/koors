@@ -1,11 +1,14 @@
 import {Animated, Text, StyleSheet, View} from 'react-native';
-import {useCallback, useEffect, useMemo, useRef, useState} from "react";
+import {useEffect, useMemo, useRef, useState} from "react";
 import HealthKit, {
   useMostRecentQuantitySample,
 } from "@kingstinct/react-native-healthkit";
 import KoorsButton from "@/components/KoorsButton";
 import {startAdvertising, stopAdvertising} from "munim-bluetooth-peripheral";
 import Voice from '@react-native-voice/voice';
+import {useMutation, useQuery} from "@tanstack/react-query";
+
+const koorsIp = "172.20.10.7"
 
 export default function HomeScreen() {
   const [heartRate, setHeartRate] = useState(useMostRecentQuantitySample("HKQuantityTypeIdentifierHeartRate")?.quantity ?? 0);
@@ -18,6 +21,37 @@ export default function HomeScreen() {
   const backdropRef = useRef(new Animated.Value(0)).current
   const commandColorRef = useRef(new Animated.Value(0)).current
   const commandAnimRef = useRef(new Animated.Value(1)).current
+
+  // Communication with Koors
+  const koorsStatusQuery = useQuery({
+    queryKey: ['koorsStatus'],
+    queryFn: async () => {
+      console.log("attempting to get status...")
+      const resp = await fetch(`http://${koorsIp}:8080/dispatch_status`)
+      const jsonResp = await resp.json()
+      return jsonResp["status"]
+    },
+    refetchInterval: 1000,
+  })
+  console.log(koorsStatusQuery.data)
+
+  const performMutation = useMutation({
+    mutationFn: async (command: string) => {
+      console.log("attempting to perform command " + command)
+      const resp = await fetch(`http://${koorsIp}:8080/perform?action=${command}`, {
+        method: "POST",
+      })
+    }
+  })
+
+  const dispatchMutation = useMutation({
+    mutationFn: async () => {
+      console.log("attempting to dispatch")
+      const resp = await fetch(`http://${koorsIp}:8080/dispatch`, {
+        method: "POST",
+      })
+    }
+  })
 
   // Listen live while the app is open
   useEffect(() => {
@@ -37,26 +71,35 @@ export default function HomeScreen() {
     }
   }, []);
 
-  const beatingHeartAnim = useRef(new Animated.Value(1)).current
+  const beatingHeartAnim = useRef(new Animated.Value(1.1)).current
   useEffect(() => {
-    Animated.loop(
-      Animated.spring(beatingHeartAnim, {
-        toValue: 1.1,
+    const anim = Animated.loop(
+      Animated.timing(beatingHeartAnim, {
+        toValue: 1,
+        duration: Math.round((60 / (heartRate + 1)) * 1000),
         useNativeDriver: true,
       }),
       {
         iterations: -1,
       },
-    ).start()
-  }, []);
+    )
 
-  const koorsState: 'searching' | 'ready' = useMemo(() => {
-    if (heartRate >= 180) {
-      return 'searching'
-    } else {
-      return 'ready'
+    anim.start()
+
+    return () => {
+      anim.stop()
     }
-  }, [heartRate])
+  }, [heartRate]);
+
+  const koorsState: 'searching' | 'ready' | 'unknown' = useMemo(() => {
+    if (koorsStatusQuery.data === "dispatched") {
+      return 'searching'
+    } else if (koorsStatusQuery.data === "ready") {
+      return 'ready'
+    } else {
+      return 'unknown'
+    }
+  }, [koorsStatusQuery.data])
 
   const [koorsStateText, koorsStateColor] = useMemo(() => {
     switch (koorsState) {
@@ -64,6 +107,8 @@ export default function HomeScreen() {
         return ['Ready', '#2da400']
       case 'searching':
         return ['Searching...', '#d5af00']
+      case 'unknown':
+        return ['Unknown', '#575757']
     }
   }, [koorsState])
 
@@ -179,6 +224,11 @@ export default function HomeScreen() {
       duration: 80,
       useNativeDriver: false,
     }).start()
+
+    // Send mutation
+    if (realizedCommand) {
+        performMutation.mutate(realizedCommand)
+    }
   }
 
   const commandColor = useMemo(() => {
@@ -212,7 +262,11 @@ export default function HomeScreen() {
           </View>
 
           <View style={styles.buttons}>
-            <KoorsButton>Koors, IM DYING!</KoorsButton>
+            <KoorsButton
+              onPress={() => dispatchMutation.mutate()}
+            >
+              Koors, IM DYING!
+            </KoorsButton>
             <KoorsButton
               variant="transparent"
               onPressIn={startListening}
