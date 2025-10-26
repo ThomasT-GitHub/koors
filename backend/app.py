@@ -177,7 +177,7 @@ def dispatch():
     """Start the navigator in the background."""
     result = start_navigator()
     code = 200 if result.get("ok") else 500
-    return jsonify(result), code
+    return jsonify({"dispatched": code == 200}), code
 
 # ---- NEW: halt navigator ----
 @app.post("/halt")
