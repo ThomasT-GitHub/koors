@@ -14,6 +14,7 @@ import pathlib
 from typing import Optional, List, Tuple, Union, Callable
 from flask import Flask, jsonify, request, Response
 from bleak import BleakScanner
+import robot.controller as dog
 
 # -------- Config via env --------
 RAW_UUID = (os.getenv("TARGET_SERVICE_UUID") or "").strip()   # e.g. 1802 or 1234...90AB
@@ -185,6 +186,19 @@ def halt():
     result = stop_navigator()
     code = 200 if result.get("ok") else 500
     return jsonify(result), code
+
+# perform an action specified with the action query parameter
+@app.post("/perform")
+def action():
+    requested_action = request.args.get("perform")
+    match requested_action:
+        case "flip":
+            ok = dog.flip()
+            return 200 if ok else 500
+        case "help":
+            return jsonify({ "dispatched": True }), 200
+        case _:
+            return jsonify({ "message": "action parameter is required" }), 400
 
 # ---- NEW: process_speech (override navigation and perform an action) ----
 @app.post("/process_speech")
