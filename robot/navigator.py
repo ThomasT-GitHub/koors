@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # project/robot/navigator.py
-# Beacon-homing walker with obstacle avoidance (FSM), using `controller`.
-# Reads RSSI from backend/app.py (/status). Matches prior navigator behavior.
+# Beacon-homing walker (no full scans) with minimum 5-second walking actions.
 
 import os
 import time
@@ -9,69 +8,66 @@ import random
 import requests
 from typing import Optional
 
-# --- import controller from sibling file ---
+# ---- controller import ----
 try:
-    import controller  # project/robot/controller.py
-except Exception as e:
-    # Fallback: tweak sys.path to include this file's directory
+    import controller
+except Exception:
     import sys, pathlib
     HERE = pathlib.Path(__file__).resolve().parent
     if str(HERE) not in sys.path:
         sys.path.insert(0, str(HERE))
-    import controller  # retry
+    import controller
 
-# --- Optional ultrasonic support (safe if missing) ---
+# ---- optional ultrasonic hook ----
 def _try_get_distance() -> Optional[float]:
-    """
-    If you later add a backend sensor function (e.g., backend/input.py:get_distance),
-    we’ll use it. Otherwise return None to keep FSM RSSI-only.
-    """
     try:
-        # Lazy import to avoid hard dependency
         from backend.input import get_distance  # type: ignore
         d = get_distance()
         return float(d) if d is not None else None
     except Exception:
         return None
 
-# ========= Config =========
+# ========= Config / Tunables =========
 APP_STATUS_URL = os.getenv("APP_STATUS_URL", "http://127.0.0.1:8080/status")
 DOG_PORT = os.getenv("DOG_PORT", "/dev/ttyUSB0")
 
-# -------- Tunables --------
-RSSI_EMA_ALPHA = 0.35
-RSSI_VALID_AGE_S = 2.5
-RSSI_MIN_SEEN = -95
+# RSSI filtering & thresholds
+RSSI_EMA_ALPHA     = 0.35
+RSSI_VALID_AGE_S   = 2.5
+RSSI_MIN_SEEN      = -95
 RSSI_APPROACH_GOOD = -70
 
-SCAN_TURN_SECS = 0.35
-SCAN_SETTLE_MS = 150
-SCAN_SECTORS = 10
-SCAN_COOLDOWN_S = 6.0
+# Motion tuning
+STEP_MIN_S    = 5.0    # minimum walking time per step (seconds)
+STEP_BASE_S   = 5.0    # normal forward step
+STEP_NEAR_S   = 5.0    # cautious step near strong RSSI
+MICRO_PAUSE   = 0.15
+STEER_GAIN    = 0.3    # turn duration
 
-ADVANCE_STEP_S = 0.6
-MICRO_PAUSE_S = 0.15
-
-OBSTACLE_NEAR_CM = 45
+# Obstacle avoidance
+OBSTACLE_NEAR_CM  = 45
 OBSTACLE_CLEAR_CM = 65
-AVOID_TURN_SECS = 0.5
-AVOID_STEP_S = 0.8
+AVOID_TURN_S      = 0.5
+AVOID_STEP_S      = 5.0  # also 5s walk when avoiding
 
+# Lost / reacquire
 LOST_TIMEOUT_S = 6.0
-LOST_SPIN_SECS = 0.4
+REACQ_SPIN_S   = 0.4
 
-GLOBAL_RUN_LIMIT_S = 60 * 10  # 10 minutes
+GLOBAL_RUN_LIMIT_S = 60 * 10
 
-# ========= Controller adapter (adds tiny helpers) =========
+# ========= Controller shim with fallbacks =========
 class Dog:
-    """
-    Thin shim over your `controller` so the FSM can call a consistent set of methods.
-    """
+    WALK_FWD_TOKEN   = os.getenv("WALK_FWD_TOKEN",   "kwkF")
+    WALK_BACK_TOKEN  = os.getenv("WALK_BACK_TOKEN",  "kwkB")
+    TURN_LEFT_TOKEN  = os.getenv("TURN_LEFT_TOKEN",  "kwkL")
+    TURN_RIGHT_TOKEN = os.getenv("TURN_RIGHT_TOKEN", "kwkR")
+    BALANCE_TOKEN    = os.getenv("BALANCE_TOKEN",    "kbalance")
+
     def __init__(self):
         self._connected = False
 
     def connect_dog(self, port: Optional[str] = None, baud: Optional[int] = None) -> bool:
-        # controller.connect_dog takes (port), no baud needed
         p = port or DOG_PORT
         try:
             ok = controller.connect_dog(p)
@@ -90,284 +86,183 @@ class Dog:
         finally:
             self._connected = False
 
-    # Movement primitives (your controller already supports these)
+    def _send(self, cmd: str):
+        if hasattr(controller, "send_raw_command"):
+            controller.send_raw_command(cmd)
+        elif hasattr(controller, "send_command"):
+            controller.send_command(cmd)
+        else:
+            fn = getattr(controller, cmd, None)
+            if callable(fn):
+                fn()
+
+    def _pulse(self, cmd: str, burst_s: float, settle_s: float = 0.10):
+        self._send(cmd)
+        time.sleep(max(0.05, burst_s))
+        self._send(self.BALANCE_TOKEN)
+        time.sleep(max(0.05, settle_s))
+
     def stop(self):
         if hasattr(controller, "stop"):
             controller.stop()
         else:
-            # Fallback to a neutral stance
-            if hasattr(controller, "stand"):
-                controller.stand()
+            self._send(self.BALANCE_TOKEN)
 
-    def stand(self): controller.stand() if hasattr(controller, "stand") else None
-    def sit(self): controller.sit() if hasattr(controller, "sit") else None
+    def stand(self):
+        if hasattr(controller, "stand"):
+            controller.stand()
+        else:
+            self._send("kup")
 
-    def walk_forward(self, duration: float): controller.walk_forward(duration)
-    def walk_backward(self, duration: float): controller.walk_backward(duration)
-    def turn_left(self, duration: float): controller.turn_left(duration)
-    def turn_right(self, duration: float): controller.turn_right(duration)
+    def sit(self):
+        if hasattr(controller, "sit"):
+            controller.sit()
+        else:
+            self._send("krest")
+
+    def walk_forward(self, duration: float):
+        duration = max(duration, STEP_MIN_S)
+        print(f"[WALK] forward {duration:.1f}s")
+        if hasattr(controller, "walk_forward"):
+            controller.walk_forward(duration)
+            return
+        t_end = time.time() + duration
+        while time.time() < t_end:
+            self._pulse(self.WALK_FWD_TOKEN, 0.25, 0.10)
+
+    def walk_backward(self, duration: float):
+        duration = max(duration, STEP_MIN_S)
+        print(f"[WALK] backward {duration:.1f}s")
+        if hasattr(controller, "walk_backward"):
+            controller.walk_backward(duration)
+            return
+        t_end = time.time() + duration
+        while time.time() < t_end:
+            self._pulse(self.WALK_BACK_TOKEN, 0.25, 0.10)
+
+    def turn_left(self, duration: float):
+        print(f"[TURN] left {duration:.1f}s")
+        if hasattr(controller, "turn_left"):
+            controller.turn_left(duration)
+            return
+        t_end = time.time() + duration
+        while time.time() < t_end:
+            self._pulse(self.TURN_LEFT_TOKEN, 0.16, 0.08)
+
+    def turn_right(self, duration: float):
+        print(f"[TURN] right {duration:.1f}s")
+        if hasattr(controller, "turn_right"):
+            controller.turn_right(duration)
+            return
+        t_end = time.time() + duration
+        while time.time() < t_end:
+            self._pulse(self.TURN_RIGHT_TOKEN, 0.16, 0.08)
 
 dog = Dog()
 
-# ========= BLE status client =========
+# ========= Beacon RSSI client =========
 class BeaconRSSI:
     def __init__(self):
         self.ema: Optional[float] = None
         self.last_seen: float = 0.0
-        self.addr: Optional[str] = None
-        self.name: Optional[str] = None
-
     def refresh(self) -> Optional[float]:
-        """
-        Pull RSSI from /status, update EMA, return EMA if valid.
-        Expects backend/app.py to serve {"beacon": {"rssi": int, "last_seen_epoch": float, ...}}
-        """
         try:
             r = requests.get(APP_STATUS_URL, timeout=0.5)
             j = r.json()
             b = j.get("beacon") or {}
             rssi = b.get("rssi")
             last_seen_epoch = float(b.get("last_seen_epoch") or 0.0)
-
-            if rssi is None:
-                return self.ema
-
-            # Skip stale samples
-            if (time.time() - last_seen_epoch) > RSSI_VALID_AGE_S:
-                return self.ema
-
-            # EMA
+            if rssi is None: return self.ema
+            if (time.time() - last_seen_epoch) > RSSI_VALID_AGE_S: return self.ema
             rr = float(rssi)
             self.ema = rr if self.ema is None else (RSSI_EMA_ALPHA * rr + (1.0 - RSSI_EMA_ALPHA) * self.ema)
             self.last_seen = time.time()
-            self.addr = b.get("address")
-            self.name = b.get("name")
             return self.ema
         except Exception:
             return self.ema
-
     def is_recent(self) -> bool:
         return (time.time() - self.last_seen) <= LOST_TIMEOUT_S
 
-# ========= Heading bookkeeping (time-based) =========
-class TimedHeading:
-    """
-    No IMU; integrate timed turns. One revolution ~ SCAN_SECTORS * SCAN_TURN_SECS.
-    """
-    def __init__(self):
-        self.deg = 0.0
-
-    def deg_per_second(self) -> float:
-        rev_secs = max(0.1, SCAN_SECTORS * SCAN_TURN_SECS)
-        return 360.0 / rev_secs
-
-    def turn_left_t(self, secs: float):
-        dog.turn_left(secs)
-        self.deg = (self.deg + secs * self.deg_per_second()) % 360.0
-
-    def turn_right_t(self, secs: float):
-        dog.turn_right(secs)
-        self.deg = (self.deg - secs * self.deg_per_second()) % 360.0
-
-# ========= FSM =========
-SEARCH, ALIGN, ADVANCE, AVOID, LOST = "SEARCH", "ALIGN", "ADVANCE", "AVOID", "LOST"
-
+# ========= Helpers =========
 def get_ultrasonic_distance_cm() -> Optional[float]:
-    return _try_get_distance()  # None unless you add backend/input.py:get_distance
+    return _try_get_distance()
 
-def get_camera_obstacle() -> bool:
-    return False  # stub (add vision later if desired)
+def obstacle_ahead() -> bool:
+    d = get_ultrasonic_distance_cm()
+    if d is None or d <= 0:
+        return False
+    return d < OBSTACLE_NEAR_CM
 
-class Navigator:
-    def __init__(self):
-        self.beacon = BeaconRSSI()
-        self.hdg = TimedHeading()
-        self.state = SEARCH
-        self.last_scan_t = 0.0
-        self.global_start = time.time()
-        self.closest_rssi_seen = -999.0
+def path_clear() -> bool:
+    d = get_ultrasonic_distance_cm()
+    return (d is None) or (d >= OBSTACLE_CLEAR_CM)
 
-    def log(self, msg: str):
-        print(f"[{self.state}] {msg}")
+# ========= Main loop =========
+def run():
+    global_start = time.time()
+    print(f"[BOOT] Checking beacon at {APP_STATUS_URL}")
+    try:
+        ping = requests.get(APP_STATUS_URL, timeout=1.0).json().get("beacon", {})
+        print(f"[BOOT] rssi={ping.get('rssi')} age={ping.get('age_secs')}")
+    except Exception as e:
+        print(f"[BOOT] /status unreachable: {e}")
 
-    def obstacle_ahead(self) -> bool:
-        d = get_ultrasonic_distance_cm()
-        cam_block = get_camera_obstacle()
-        if cam_block:
-            return True
-        if d is None:
-            return False
-        return d < OBSTACLE_NEAR_CM
+    print("[INIT] Connecting to dog…")
+    if not dog.connect_dog(DOG_PORT):
+        print(f"❌ Failed to open port {DOG_PORT}")
+        return
 
-    def path_clear(self) -> bool:
-        d = get_ultrasonic_distance_cm()
-        if d is None:
-            return True
-        return d >= OBSTACLE_CLEAR_CM
+    dog.stand(); time.sleep(1.0); dog.stop()
 
-    def bearing_scan(self) -> Optional[int]:
-        self.log("Starting bearing scan…")
-        best_idx, best_val = None, -9999.0
-        spin_left = random.choice([True, False])
+    beacon = BeaconRSSI()
+    closest_rssi_seen = -999.0
 
-        for i in range(SCAN_SECTORS):
-            if spin_left:
-                self.hdg.turn_left_t(SCAN_TURN_SECS)
-            else:
-                self.hdg.turn_right_t(SCAN_TURN_SECS)
+    try:
+        while True:
+            if GLOBAL_RUN_LIMIT_S and (time.time() - global_start) > GLOBAL_RUN_LIMIT_S:
+                print("[SAFE] Global run limit reached.")
+                break
 
-            time.sleep(SCAN_SETTLE_MS / 1000.0)
-            rssi = self.beacon.refresh()
-            if rssi is not None and rssi > best_val:
-                best_val = rssi
-                best_idx = i
+            rssi = beacon.refresh()
+            if rssi is not None:
+                closest_rssi_seen = max(closest_rssi_seen, rssi)
 
-        # Rewind to best sector
-        if best_idx is not None:
-            steps = (SCAN_SECTORS - 1 - best_idx) if spin_left else (best_idx + 1)
-            turn_secs = steps * SCAN_TURN_SECS
-            if spin_left:
-                self.hdg.turn_right_t(turn_secs)
-            else:
-                self.hdg.turn_left_t(turn_secs)
+            # Lost? small spin to reacquire
+            if (rssi is None) or (not beacon.is_recent()) or (rssi < RSSI_MIN_SEEN):
+                print("[HOMING] Weak or lost signal; spinning to reacquire…")
+                dog.turn_left(REACQ_SPIN_S)
+                time.sleep(MICRO_PAUSE)
+                continue
 
-        self.last_scan_t = time.time()
-        self.log(f"Scan done. Best sector={best_idx} RSSI≈{best_val:.1f} dBm")
-        return best_idx
-
-    def step(self):
-        # Global backstop
-        if GLOBAL_RUN_LIMIT_S and (time.time() - self.global_start) > GLOBAL_RUN_LIMIT_S:
-            self.log("Global time limit reached; stopping.")
-            dog.stop()
-            raise SystemExit
-
-        # Refresh RSSI
-        rssi = self.beacon.refresh()
-        if rssi is not None:
-            self.closest_rssi_seen = max(self.closest_rssi_seen, rssi)
-
-        # --- SEARCH ---
-        if self.state == SEARCH:
-            if self.beacon.is_recent() and (rssi is not None and rssi > RSSI_MIN_SEEN):
-                if (time.time() - self.last_scan_t) > SCAN_COOLDOWN_S:
-                    self.bearing_scan()
-                self.state = ALIGN
-                return
-
-            self.log("No good RSSI; spinning to find beacon…")
-            self.hdg.turn_left_t(LOST_SPIN_SECS)
-            time.sleep(MICRO_PAUSE_S)
-            return
-
-        # --- ALIGN ---
-        if self.state == ALIGN:
-            if self.obstacle_ahead():
-                self.log("Obstacle ahead during ALIGN; switching to AVOID.")
+            # Avoid obstacles if any
+            if obstacle_ahead():
+                print("[AVOID] obstacle ahead → sidestep")
+                dog.turn_left(AVOID_TURN_S)
+                time.sleep(MICRO_PAUSE)
+                dog.walk_forward(AVOID_STEP_S)
                 dog.stop()
-                self.state = AVOID
-                return
+                continue
 
-            if rssi is not None and rssi >= RSSI_APPROACH_GOOD:
-                self.state = ADVANCE
-                return
+            # Stronger RSSI → still 5s (minimum)
+            step_time = max(STEP_BASE_S if rssi < RSSI_APPROACH_GOOD else STEP_NEAR_S, STEP_MIN_S)
+            print(f"[ADV] rssi={rssi:.1f} → forward {step_time:.1f}s")
 
-            if (time.time() - self.last_scan_t) > SCAN_COOLDOWN_S:
-                self.bearing_scan()
-
-            if random.random() < 0.5:
-                self.hdg.turn_left_t(0.18)
-            else:
-                self.hdg.turn_right_t(0.18)
-            time.sleep(MICRO_PAUSE_S)
-
-            if not self.beacon.is_recent() or (rssi is None or rssi < RSSI_MIN_SEEN):
-                self.state = LOST
-            return
-
-        # --- ADVANCE ---
-        if self.state == ADVANCE:
-            if self.obstacle_ahead():
-                self.log("Obstacle detected during ADVANCE; switching to AVOID.")
-                dog.stop()
-                self.state = AVOID
-                return
-
-            if not self.beacon.is_recent() or (rssi is None or rssi < RSSI_MIN_SEEN):
-                self.log("Lost beacon while advancing.")
-                dog.stop()
-                self.state = LOST
-                return
-
-            step_time = ADVANCE_STEP_S * (0.5 if rssi >= RSSI_APPROACH_GOOD else 1.0)
+            # Move forward
             dog.walk_forward(step_time)
-            time.sleep(MICRO_PAUSE_S)
+            time.sleep(MICRO_PAUSE)
 
-            rssi_after = self.beacon.refresh() or rssi
-            if rssi_after < self.closest_rssi_seen - 1.5:
-                if random.random() < 0.5:
-                    self.hdg.turn_left_t(0.2)
-                else:
-                    self.hdg.turn_right_t(0.2)
-                time.sleep(MICRO_PAUSE_S)
+            rssi_after = beacon.refresh() or rssi
+            if rssi_after < closest_rssi_seen - 1.5:
+                print(f"[CORR] RSSI dropped ({rssi_after:.1f} vs best {closest_rssi_seen:.1f}) → turning")
+                if random.random() < 0.5: dog.turn_left(STEER_GAIN)
+                else: dog.turn_right(STEER_GAIN)
+                time.sleep(MICRO_PAUSE)
 
-            if (time.time() - self.last_scan_t) > (SCAN_COOLDOWN_S * 1.5):
-                self.bearing_scan()
-            return
-
-        # --- AVOID ---
-        if self.state == AVOID:
-            turn_dir_left = random.random() < 0.5
-            self.log(f"Avoiding: turn {'left' if turn_dir_left else 'right'} & step.")
-            if turn_dir_left:
-                self.hdg.turn_left_t(AVOID_TURN_SECS)
-            else:
-                self.hdg.turn_right_t(AVOID_TURN_SECS)
-            time.sleep(MICRO_PAUSE_S)
-
-            dog.walk_forward(AVOID_STEP_S)
-            time.sleep(MICRO_PAUSE_S)
-            dog.stop()
-
-            if self.path_clear():
-                self.state = ALIGN
-            else:
-                self.log("Path still blocked; repeating avoid maneuver.")
-            return
-
-        # --- LOST ---
-        if self.state == LOST:
-            self.log("Reacquiring beacon…")
-            self.hdg.turn_right_t(LOST_SPIN_SECS)
-            time.sleep(MICRO_PAUSE_S)
-
-            if self.beacon.is_recent() and (rssi is not None and rssi > RSSI_MIN_SEEN):
-                self.state = SEARCH
-            return
-
-    def run(self):
-        self.log("Starting navigator. Connecting to dog…")
-        if not dog.is_connected():
-            if not dog.connect_dog(DOG_PORT):
-                print(f"❌ Failed to open port {DOG_PORT}.")
-                print("💡 macOS ports look like /dev/tty.usbserial-XXXX or /dev/tty.usbmodem-XXXX")
-                print("   Linux/Pi ports look like /dev/ttyUSB0 or /dev/ttyAMA0 (add user to 'dialout').")
-                return
-
-        # Neutral posture to start
-        dog.stand()
-        time.sleep(1.0)
-        dog.stop()
-
-        try:
-            while True:
-                self.step()
-        except KeyboardInterrupt:
-            print("\n[MAIN] Ctrl-C received. Stopping.")
-        finally:
-            dog.stop()
-            dog.sit()
-            dog.disconnect()
+    except KeyboardInterrupt:
+        print("\n[MAIN] Ctrl-C received. Stopping.")
+    finally:
+        dog.stop(); dog.sit(); dog.disconnect()
+        print("[DONE] Navigator stopped.")
 
 if __name__ == "__main__":
-    Navigator().run()
+    run()
