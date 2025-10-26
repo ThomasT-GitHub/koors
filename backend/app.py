@@ -12,8 +12,9 @@ import threading
 import subprocess
 import pathlib
 from typing import Optional, List, Tuple, Union, Callable
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 from bleak import BleakScanner
+import robot.controller as dog
 
 # -------- Config via env --------
 RAW_UUID = (os.getenv("TARGET_SERVICE_UUID") or "").strip()   # e.g. 1802 or 1234...90AB
@@ -39,6 +40,14 @@ try:
     _controller_ok = True
 except Exception as _e:
     _controller_ok = False
+
+# Import camera module
+try:
+    from camera import CameraManager, generate_mjpeg_stream
+    _camera_ok = True
+except Exception as _e:
+    _camera_ok = False
+    print(f"[INIT] Camera module not available: {_e}")
 
 def expand_uuid(u: str) -> Optional[str]:
     if not u:
@@ -135,6 +144,16 @@ def stop_navigator(timeout: float = 3.0) -> dict:
 # ========== Flask app ==========
 app = Flask(__name__)
 
+# ========== Camera manager ==========
+camera = None
+if _camera_ok:
+    try:
+        camera = CameraManager()
+        # Camera starts on demand via /camera/start endpoint
+        print("[INIT] Camera manager initialized (not started)")
+    except Exception as e:
+        print(f"[INIT] Failed to initialize camera manager: {e}")
+
 @app.get("/status")
 def status():
     return jsonify({
@@ -158,7 +177,7 @@ def dispatch():
     """Start the navigator in the background."""
     result = start_navigator()
     code = 200 if result.get("ok") else 500
-    return jsonify(result), code
+    return jsonify({"dispatched": code == 200}), code
 
 # ---- NEW: halt navigator ----
 @app.post("/halt")
@@ -167,6 +186,19 @@ def halt():
     result = stop_navigator()
     code = 200 if result.get("ok") else 500
     return jsonify(result), code
+
+# perform an action specified with the action query parameter
+@app.post("/perform")
+def action():
+    requested_action = request.args.get("perform")
+    match requested_action:
+        case "flip":
+            ok = dog.flip()
+            return 200 if ok else 500
+        case "help":
+            return jsonify({ "dispatched": True }), 200
+        case _:
+            return jsonify({ "message": "action parameter is required" }), 400
 
 # ---- NEW: process_speech (override navigation and perform an action) ----
 @app.post("/process_speech")
@@ -234,6 +266,67 @@ def process_speech():
             return jsonify({"ok": False, "error": f"action_failed: {e}"}), 500
 
     return jsonify({"ok": True, "action": action, "overrode_navigation": True}), 200
+
+# ========== Camera endpoints ==========
+@app.get("/camera/status")
+def camera_status():
+    """Get camera status."""
+    if not camera:
+        return jsonify({"ok": False, "error": "camera_not_available"}), 503
+    return jsonify({"ok": True, **camera.get_status()})
+
+@app.post("/camera/start")
+def camera_start():
+    """Start camera capture."""
+    if not camera:
+        return jsonify({"ok": False, "error": "camera_not_available"}), 503
+
+    if camera.is_running():
+        return jsonify({"ok": True, "status": "already_running"})
+
+    success = camera.start()
+    if success:
+        return jsonify({"ok": True, "status": "started"})
+    else:
+        return jsonify({"ok": False, "error": "failed_to_start"}), 500
+
+@app.post("/camera/stop")
+def camera_stop():
+    """Stop camera capture."""
+    if not camera:
+        return jsonify({"ok": False, "error": "camera_not_available"}), 503
+
+    camera.stop()
+    return jsonify({"ok": True, "status": "stopped"})
+
+@app.get("/camera/snapshot")
+def camera_snapshot():
+    """Get a single JPEG snapshot."""
+    if not camera:
+        return jsonify({"ok": False, "error": "camera_not_available"}), 503
+
+    if not camera.is_running():
+        return jsonify({"ok": False, "error": "camera_not_running"}), 400
+
+    frame = camera.get_frame()
+    if frame is None:
+        return jsonify({"ok": False, "error": "no_frame_available"}), 503
+
+    return Response(frame, mimetype='image/jpeg')
+
+@app.get("/camera/stream")
+def camera_stream():
+    """Stream MJPEG video feed."""
+    if not camera:
+        return jsonify({"ok": False, "error": "camera_not_available"}), 503
+
+    if not camera.is_running():
+        return jsonify({"ok": False, "error": "camera_not_running"}), 400
+
+    return Response(
+        generate_mjpeg_stream(camera),
+        mimetype='multipart/x-mixed-replace; boundary=frame'
+    )
 
 def run_flask():
     # 127.0.0.1 keeps it local; change to 0.0.0.0 if you want LAN access.
