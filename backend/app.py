@@ -1,12 +1,17 @@
 # app_linux.py
 # Flask 3 + Bleak (Linux/BlueZ). Scanner on main thread, Flask in a background thread.
+# Adds: /dispatch, /halt, /process_speech endpoints to control navigator and tricks.
 
 import os
 import re
+import sys
 import time
 import asyncio
+import signal
 import threading
-from typing import Optional, List, Tuple, Union
+import subprocess
+import pathlib
+from typing import Optional, List, Tuple, Union, Callable
 from flask import Flask, jsonify, request
 from bleak import BleakScanner
 
@@ -19,6 +24,21 @@ STOP_CMD = os.getenv("STOP_CMD", "d")
 # Linux/BlueZ specific
 ADAPTER = os.getenv("ADAPTER", "hci0")          # e.g., hci0 or hci1
 SCANNING_MODE = os.getenv("SCANNING_MODE", "active")  # "active" or "passive"
+
+# Paths (project layout)
+HERE = pathlib.Path(__file__).resolve()
+PROJECT_ROOT = HERE.parents[1]  # project/
+ROBOT_DIR = PROJECT_ROOT / "robot"
+NAVIGATOR_PATH = ROBOT_DIR / "navigator.py"
+
+# Make sure we can import robot/controller.py for process_speech actions
+if str(ROBOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROBOT_DIR))
+try:
+    import controller  # project/robot/controller.py
+    _controller_ok = True
+except Exception as _e:
+    _controller_ok = False
 
 def expand_uuid(u: str) -> Optional[str]:
     if not u:
@@ -69,7 +89,50 @@ class PetoiSerialStub:
 
 serial = PetoiSerialStub()
 
-# -------- Flask app (in a thread) --------
+# ========== Navigator process management ==========
+_nav_lock = threading.Lock()
+_nav_proc: Optional[subprocess.Popen] = None
+
+def _proc_alive(p: Optional[subprocess.Popen]) -> bool:
+    return p is not None and (p.poll() is None)
+
+def start_navigator() -> dict:
+    """Launch project/robot/navigator.py in a background process."""
+    global _nav_proc
+    with _nav_lock:
+        if _proc_alive(_nav_proc):
+            return {"ok": True, "status": "already_running", "pid": _nav_proc.pid}
+        if not NAVIGATOR_PATH.exists():
+            return {"ok": False, "error": f"navigator.py not found at {NAVIGATOR_PATH}"}
+        # Inherit env; you can pass DOG_PORT/APP_STATUS_URL via env if needed
+        cmd = [sys.executable, str(NAVIGATOR_PATH)]
+        try:
+            _nav_proc = subprocess.Popen(cmd, cwd=str(ROBOT_DIR))
+            return {"ok": True, "status": "dispatched", "pid": _nav_proc.pid}
+        except Exception as e:
+            return {"ok": False, "error": f"failed_to_start: {e}"}
+
+def stop_navigator(timeout: float = 3.0) -> dict:
+    """Stop the running navigator process (if any)."""
+    global _nav_proc
+    with _nav_lock:
+        if not _proc_alive(_nav_proc):
+            _nav_proc = None
+            return {"ok": True, "status": "not_running"}
+        try:
+            _nav_proc.terminate()
+            t0 = time.time()
+            while time.time() - t0 < timeout and _proc_alive(_nav_proc):
+                time.sleep(0.05)
+            if _proc_alive(_nav_proc):
+                _nav_proc.kill()
+            pid = _nav_proc.pid
+            _nav_proc = None
+            return {"ok": True, "status": "stopped", "pid": pid}
+        except Exception as e:
+            return {"ok": False, "error": f"failed_to_stop: {e}"}
+
+# ========== Flask app ==========
 app = Flask(__name__)
 
 @app.get("/status")
@@ -83,21 +146,94 @@ def status():
             "scanning_mode": SCANNING_MODE,
             "walk_cmd": WALK_CMD,
             "stop_cmd": STOP_CMD,
+            "navigator_running": _proc_alive(_nav_proc),
         },
         "beacon": state.as_dict()
     })
 
-@app.post("/walk")
-def walk():
-    body = request.get_json(silent=True) or {}
-    cmd = (body.get("cmd") or WALK_CMD).strip()
-    serial.send(cmd)
-    return jsonify({"ok": True, "sent": cmd, "beacon": state.as_dict()})
 
-@app.post("/stop")
-def stop():
-    serial.send(STOP_CMD)
-    return jsonify({"ok": True, "sent": STOP_CMD})
+# ---- NEW: dispatch navigator ----
+@app.post("/dispatch")
+def dispatch():
+    """Start the navigator in the background."""
+    result = start_navigator()
+    code = 200 if result.get("ok") else 500
+    return jsonify(result), code
+
+# ---- NEW: halt navigator ----
+@app.post("/halt")
+def halt():
+    """Stop the navigator if running."""
+    result = stop_navigator()
+    code = 200 if result.get("ok") else 500
+    return jsonify(result), code
+
+# ---- NEW: process_speech (override navigation and perform an action) ----
+@app.post("/process_speech")
+def process_speech():
+
+    if not _controller_ok:
+        return jsonify({"ok": False, "error": "controller import failed; ensure project/robot/controller.py is available"}), 500
+
+    body = request.get_json(silent=True) or {}
+    action = (body.get("action") or "").strip().lower()
+    if not action:
+        return jsonify({"ok": False, "error": "missing 'action'"}), 400
+
+    # 1) Override any ongoing navigation
+    stop_navigator()
+
+    # 2) Map actions to controller calls
+    ACTIONS: dict[str, Callable[[], None]] = {}
+
+    def _cheer():
+        # A simple cheer routine using common primitives
+        # Fallbacks are safe if some calls don't exist.
+        if hasattr(controller, "bark"): controller.bark()
+        if hasattr(controller, "wave"): controller.wave()
+        if hasattr(controller, "bark"): controller.bark()
+
+    def _call_if(name: str, *args, **kwargs):
+        fn = getattr(controller, name, None)
+        if callable(fn):
+            fn(*args, **kwargs)
+            return True
+        return False
+
+    ACTIONS["wave"] = lambda: _call_if("wave") or None
+    ACTIONS["push_up"] = lambda: _call_if("push_up") or None
+    ACTIONS["flip"] = lambda: _call_if("flip") or None
+    ACTIONS["cheer"] = _cheer
+
+    if action not in ACTIONS:
+        return jsonify({"ok": False, "error": f"unsupported action '{action}'"}), 400
+
+    # 3) Execute the action (connect → act → (optional) disconnect)
+    port = os.getenv("DOG_PORT", "/dev/ttyUSB0")
+    try:
+        if not controller.connect_dog(port):
+            return jsonify({"ok": False, "error": f"failed to connect on {port}"}), 500
+
+        # Small prep: stand if available
+        if hasattr(controller, "stand"):
+            controller.stand()
+            time.sleep(0.5)
+
+        ACTIONS[action]()
+        # Give typical motions a moment to complete
+        time.sleep(2.0)
+
+        # Safe finish
+        if hasattr(controller, "sit"): controller.sit()
+        if hasattr(controller, "disconnect"): controller.disconnect()
+    except Exception as e:
+        try:
+            if hasattr(controller, "disconnect"):
+                controller.disconnect()
+        finally:
+            return jsonify({"ok": False, "error": f"action_failed: {e}"}), 500
+
+    return jsonify({"ok": True, "action": action, "overrode_navigation": True}), 200
 
 def run_flask():
     # 127.0.0.1 keeps it local; change to 0.0.0.0 if you want LAN access.

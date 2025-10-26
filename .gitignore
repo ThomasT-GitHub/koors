@@ -13,6 +13,10 @@ dist/
 .vscode/
 .idea/
 
+#local testing files
+
+local.py
+
 
 # dependencies
 node_modules/
